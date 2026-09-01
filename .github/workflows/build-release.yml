@@ -1,0 +1,214 @@
+name: Build & Release Codeg Server
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream release tag (e.g. v0.29.0 or latest)'
+        required: true
+        default: 'latest'
+      force_build:
+        description: 'Force build even if release already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    name: Check Upstream Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Check latest tag
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REQ_TAG="${{ github.event.inputs.tag || 'latest' }}"
+          FORCE="${{ github.event.inputs.force_build || 'false' }}"
+
+          if [ "$REQ_TAG" = "latest" ] || [ -z "$REQ_TAG" ]; then
+            UPSTREAM_TAG=$(curl -sL https://api.github.com/repos/xintaofei/codeg/releases/latest | jq -r .tag_name)
+          else
+            UPSTREAM_TAG="$REQ_TAG"
+          fi
+
+          if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "null" ]; then
+            echo "Failed to fetch upstream tag" >&2
+            exit 1
+          fi
+
+          echo "Target Upstream Tag: $UPSTREAM_TAG"
+          echo "tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+
+          # Check if release already exists in this repo
+          EXISTS=$(gh release view "$UPSTREAM_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 && echo "true" || echo "false")
+          if [ "$EXISTS" = "false" ] || [ "$FORCE" = "true" ]; then
+            echo "Release needs to be built: should_build=true"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $UPSTREAM_TAG already exists and force_build is false: should_build=false"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-frontend:
+    name: Build Frontend Assets
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: xintaofei/codeg
+          ref: ${{ needs.check-upstream.outputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable Corepack & Build Web Assets
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Upload Web Assets Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-assets
+          path: out/
+          retention-days: 1
+
+  build-backend:
+    name: Build Backend (${{ matrix.arch }})
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            linker_symlink: "ln -sf /usr/bin/gcc /usr/bin/aarch64-linux-gnu-gcc && ln -sf /usr/bin/gcc-ar /usr/bin/aarch64-linux-gnu-gcc-ar"
+          - arch: x64
+            runner: ubuntu-latest
+            linker_symlink: "true"
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: oraclelinux:8
+    steps:
+      - name: Install Build Toolchains in EL8
+        run: |
+          dnf install -y gcc gcc-c++ openssl-devel git make pkgconfig curl
+          ${{ matrix.linker_symlink }}
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Checkout upstream source
+        run: |
+          git clone --depth 1 --branch ${{ needs.check-upstream.outputs.tag }} https://github.com/xintaofei/codeg.git /app
+
+      - name: Compile codeg-server & codeg-mcp
+        working-directory: /app/src-tauri
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release --bin codeg-server --bin codeg-mcp --no-default-features
+
+      - name: Stage Artifacts
+        run: |
+          mkdir -p /dist
+          cp /app/src-tauri/target/release/codeg-server /dist/
+          cp /app/src-tauri/target/release/codeg-mcp /dist/
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: /dist/
+          retention-days: 1
+
+  package-and-release:
+    name: Package and Publish Release
+    needs: [check-upstream, build-frontend, build-backend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Frontend Assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: web/
+
+      - name: Download ARM64 Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-arm64
+          path: bin-arm64/
+
+      - name: Download x64 Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-x64
+          path: bin-x64/
+
+      - name: Package Release Tarballs
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.check-upstream.outputs.tag }}"
+          
+          # ARM64 Bundle
+          mkdir -p package-arm64/web
+          cp -r web/* package-arm64/web/
+          cp bin-arm64/codeg-server bin-arm64/codeg-mcp package-arm64/
+          chmod +x package-arm64/codeg-server package-arm64/codeg-mcp
+          tar -czf "codeg-server-linux-arm64.tar.gz" -C package-arm64 .
+          sha256sum "codeg-server-linux-arm64.tar.gz" > "codeg-server-linux-arm64.tar.gz.sha256"
+
+          # x64 Bundle
+          mkdir -p package-x64/web
+          cp -r web/* package-x64/web/
+          cp bin-x64/codeg-server bin-x64/codeg-mcp package-x64/
+          chmod +x package-x64/codeg-server package-x64/codeg-mcp
+          tar -czf "codeg-server-linux-x64.tar.gz" -C package-x64 .
+          sha256sum "codeg-server-linux-x64.tar.gz" > "codeg-server-linux-x64.tar.gz.sha256"
+
+          ls -lh codeg-server-linux-*.tar.gz*
+
+      - name: Create / Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.check-upstream.outputs.tag }}"
+          TITLE="Codeg Server ${TAG} (Universal Multi-Arch Builds)"
+          
+          NOTES=$(cat <<EOF
+          Universal GLIBC 2.28-compatible server builds for **Codeg ${TAG}** (\`xintaofei/codeg\`).
+          
+          ### Included Assets:
+          - **\`codeg-server-linux-arm64.tar.gz\`**: Standalone ARM64 bundle (\`codeg-server\`, \`codeg-mcp\`, \`web/\`) compatible with Ubuntu 20.04/22.04/24.04, EL8, EL9, EL10, and Raspberry Pi.
+          - **\`codeg-server-linux-x64.tar.gz\`**: Standalone x86_64 bundle compatible with any modern or legacy GLIBC 2.28+ x86_64 Linux environment.
+          EOF
+          )
+
+          # Delete existing release if re-running
+          gh release delete "$TAG" --yes || true
+          git tag -d "$TAG" 2>/dev/null || true
+          git push --delete origin "$TAG" 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --title "$TITLE" \
+            --notes "$NOTES" \
+            codeg-server-linux-arm64.tar.gz \
+            codeg-server-linux-arm64.tar.gz.sha256 \
+            codeg-server-linux-x64.tar.gz \
+            codeg-server-linux-x64.tar.gz.sha256
