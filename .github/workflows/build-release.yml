@@ -112,7 +112,7 @@ jobs:
     steps:
       - name: Install Build Toolchains in EL8
         run: |
-          dnf install -y gcc gcc-c++ openssl-devel git make pkgconfig curl
+          dnf install -y gcc gcc-c++ openssl-devel perl perl-core git make pkgconfig curl
           ${{ matrix.linker_symlink }}
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
@@ -121,17 +121,24 @@ jobs:
         run: |
           git clone --depth 1 --branch ${{ needs.check-upstream.outputs.tag }} https://github.com/xintaofei/codeg.git /app
 
-      - name: Compile codeg-server & codeg-mcp
+      - name: Compile codeg-server & codeg-mcp (Statically Vendored OpenSSL)
         working-directory: /app/src-tauri
+        env:
+          OPENSSL_STATIC: '1'
+          OPENSSL_VENDORED: '1'
         run: |
           source $HOME/.cargo/env
+          # Patch Cargo.toml to enable vendored openssl for universal compatibility across OpenSSL 1.1 and 3.x hosts
+          sed -i 's/tokio-tungstenite = { version = "0.26", features = \["native-tls"\] }/tokio-tungstenite = { version = "0.26", features = ["native-tls-vendored"] }/g' Cargo.toml || true
           cargo build --release --bin codeg-server --bin codeg-mcp --no-default-features
 
-      - name: Stage Artifacts
+      - name: Stage & Verify Artifacts
         run: |
           mkdir -p /dist
           cp /app/src-tauri/target/release/codeg-server /dist/
           cp /app/src-tauri/target/release/codeg-mcp /dist/
+          echo "=== Dynamic Linked Libraries ==="
+          ldd /dist/codeg-server
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
