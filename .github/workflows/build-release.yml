@@ -142,6 +142,9 @@ jobs:
     needs: [check-upstream, build-frontend, build-backend]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download Frontend Assets
         uses: actions/download-artifact@v4
         with:
@@ -163,7 +166,6 @@ jobs:
       - name: Package Release Tarballs
         run: |
           set -euo pipefail
-          TAG="${{ needs.check-upstream.outputs.tag }}"
           
           # ARM64 Bundle
           mkdir -p package-arm64/web
@@ -201,11 +203,10 @@ jobs:
           )
 
           # Delete existing release if re-running
-          gh release delete "$TAG" --yes || true
-          git tag -d "$TAG" 2>/dev/null || true
-          git push --delete origin "$TAG" 2>/dev/null || true
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
 
           gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
             --title "$TITLE" \
             --notes "$NOTES" \
             codeg-server-linux-arm64.tar.gz \
