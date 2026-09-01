@@ -17,6 +17,9 @@ on:
 permissions:
   contents: write
 
+env:
+  ACTIONS_RUNNER_PRINT_DEPRECATION_WARNINGS: 'false'
+
 jobs:
   check-upstream:
     name: Check Upstream Release
